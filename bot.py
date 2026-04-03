@@ -236,21 +236,18 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 # ─── Handlers ────────────────────────────────────────────────────
 
 async def cmd_autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from dropbox import DropboxOAuth2FlowNoRedirect
-    auth_flow = DropboxOAuth2FlowNoRedirect(
-        DROPBOX_APP_KEY,
-        DROPBOX_APP_SECRET,
-        token_access_type='offline'
+    url = (
+        f"https://www.dropbox.com/oauth2/authorize"
+        f"?response_type=code"
+        f"&client_id={DROPBOX_APP_KEY}"
+        f"&token_access_type=offline"
     )
-    url = auth_flow.start()
-    context.user_data["auth_flow"] = auth_flow
     await update.message.reply_text(
-        f"🔐 *Autorizar Dropbox*\n\n"
+        f"🔐 Autorizar Dropbox\n\n"
         f"1. Acessa este link:\n{url}\n\n"
-        f"2. Clica em *Permitir*\n"
+        f"2. Clica em Permitir\n"
         f"3. Copia o código que aparecer\n"
-        f"4. Envia aqui: `/ativar CODIGO`",
-        parse_mode="Markdown"
+        f"4. Envia aqui: /ativar CODIGO"
     )
 
 
