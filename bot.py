@@ -2,6 +2,7 @@ import os
 import logging
 import io
 import json
+import requests
 import dropbox
 from dropbox.exceptions import ApiError
 from telegram import Update
@@ -26,10 +27,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")
-DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 
-# Token em memória — atualizado via /token
-current_dropbox_token = os.environ.get("DROPBOX_ACCESS_TOKEN", "")
+# Refresh token em memória — permanente após /ativar
+current_refresh_token = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 
 conversation_history: dict[int, list] = {}
 dropbox_dir: dict[int, str] = {}
@@ -167,7 +167,11 @@ TOOLS = [
 # ─── Execução das Tools ──────────────────────────────────────────
 
 def get_dbx():
-    return dropbox.Dropbox(current_dropbox_token)
+    return dropbox.Dropbox(
+        app_key=DROPBOX_APP_KEY,
+        app_secret=DROPBOX_APP_SECRET,
+        oauth2_refresh_token=current_refresh_token
+    )
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     try:
@@ -234,21 +238,6 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
 # ─── Handlers ────────────────────────────────────────────────────
 
-async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_dropbox_token
-    novo_token = " ".join(context.args).strip()
-    if not novo_token:
-        return await update.message.reply_text(
-            "Use: /token <seu_token>\n\n"
-            "Gere um novo token em:\ndropbox.com/developers/apps → Generate access token"
-        )
-    current_dropbox_token = novo_token
-    try:
-        dbx = get_dbx()
-        dbx.users_get_current_account()
-        await update.message.reply_text("✅ Token atualizado! Dropbox conectado.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Token inválido: {e}")
 
 
 async def cmd_autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,31 +257,33 @@ async def cmd_autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from dropbox import DropboxOAuth2FlowNoRedirect
+    global current_refresh_token
     codigo = " ".join(context.args).strip()
     if not codigo:
         return await update.message.reply_text("Use: /ativar <codigo>")
 
-    auth_flow = context.user_data.get("auth_flow")
-    if not auth_flow:
-        auth_flow = DropboxOAuth2FlowNoRedirect(
-            DROPBOX_APP_KEY,
-            DROPBOX_APP_SECRET,
-            token_access_type='offline'
-        )
-
     try:
-        result = auth_flow.finish(codigo)
-        refresh_token = result.refresh_token
+        resp = requests.post(
+            "https://api.dropboxapi.com/oauth2/token",
+            data={
+                "code": codigo,
+                "grant_type": "authorization_code",
+                "client_id": DROPBOX_APP_KEY,
+                "client_secret": DROPBOX_APP_SECRET,
+            }
+        )
+        data = resp.json()
+        if "refresh_token" not in data:
+            return await update.message.reply_text(f"❌ Erro: {data}")
+
+        current_refresh_token = data["refresh_token"]
         await update.message.reply_text(
-            f"✅ Dropbox autorizado!\n\n"
-            f"Agora adicione esta variável no Railway:\n\n"
-            f"`DROPBOX_REFRESH_TOKEN`\n`{refresh_token}`\n\n"
-            f"Depois faça um redeploy e o Dropbox funcionará permanentemente! 🎉",
-            parse_mode="Markdown"
+            f"✅ Dropbox conectado permanentemente!\n\n"
+            f"Salve esta variável no Railway para não precisar repetir:\n\n"
+            f"DROPBOX_REFRESH_TOKEN\n{current_refresh_token}"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Erro ao ativar: {e}")
+        await update.message.reply_text(f"❌ Erro: {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,7 +414,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("limpar", limpar))
-    app.add_handler(CommandHandler("token", cmd_token))
     app.add_handler(CommandHandler("autorizar", cmd_autorizar))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
