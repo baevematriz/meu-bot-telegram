@@ -28,6 +28,9 @@ DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")
 DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 
+# Token em memória — atualizado via /token
+current_dropbox_token = os.environ.get("DROPBOX_ACCESS_TOKEN", "")
+
 conversation_history: dict[int, list] = {}
 dropbox_dir: dict[int, str] = {}
 
@@ -164,11 +167,7 @@ TOOLS = [
 # ─── Execução das Tools ──────────────────────────────────────────
 
 def get_dbx():
-    return dropbox.Dropbox(
-        app_key=DROPBOX_APP_KEY,
-        app_secret=DROPBOX_APP_SECRET,
-        oauth2_refresh_token=DROPBOX_REFRESH_TOKEN
-    )
+    return dropbox.Dropbox(current_dropbox_token)
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     try:
@@ -234,6 +233,23 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return f"Erro: {e}"
 
 # ─── Handlers ────────────────────────────────────────────────────
+
+async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global current_dropbox_token
+    novo_token = " ".join(context.args).strip()
+    if not novo_token:
+        return await update.message.reply_text(
+            "Use: /token <seu_token>\n\n"
+            "Gere um novo token em:\ndropbox.com/developers/apps → Generate access token"
+        )
+    current_dropbox_token = novo_token
+    try:
+        dbx = get_dbx()
+        dbx.users_get_current_account()
+        await update.message.reply_text("✅ Token atualizado! Dropbox conectado.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Token inválido: {e}")
+
 
 async def cmd_autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = (
@@ -407,6 +423,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("limpar", limpar))
+    app.add_handler(CommandHandler("token", cmd_token))
     app.add_handler(CommandHandler("autorizar", cmd_autorizar))
     app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
