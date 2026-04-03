@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-DROPBOX_ACCESS_TOKEN = os.environ.get("DROPBOX_ACCESS_TOKEN", "")
+DROPBOX_APP_KEY = os.environ.get("DROPBOX_APP_KEY", "")
+DROPBOX_APP_SECRET = os.environ.get("DROPBOX_APP_SECRET", "")
+DROPBOX_REFRESH_TOKEN = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 
 conversation_history: dict[int, list] = {}
 dropbox_dir: dict[int, str] = {}
@@ -162,7 +164,11 @@ TOOLS = [
 # ─── Execução das Tools ──────────────────────────────────────────
 
 def get_dbx():
-    return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+    return dropbox.Dropbox(
+        app_key=DROPBOX_APP_KEY,
+        app_secret=DROPBOX_APP_SECRET,
+        oauth2_refresh_token=DROPBOX_REFRESH_TOKEN
+    )
 
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     try:
@@ -228,6 +234,53 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         return f"Erro: {e}"
 
 # ─── Handlers ────────────────────────────────────────────────────
+
+async def cmd_autorizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from dropbox import DropboxOAuth2FlowNoRedirect
+    auth_flow = DropboxOAuth2FlowNoRedirect(
+        DROPBOX_APP_KEY,
+        DROPBOX_APP_SECRET,
+        token_access_type='offline'
+    )
+    url = auth_flow.start()
+    context.user_data["auth_flow"] = auth_flow
+    await update.message.reply_text(
+        f"🔐 *Autorizar Dropbox*\n\n"
+        f"1. Acessa este link:\n{url}\n\n"
+        f"2. Clica em *Permitir*\n"
+        f"3. Copia o código que aparecer\n"
+        f"4. Envia aqui: `/ativar CODIGO`",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_ativar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from dropbox import DropboxOAuth2FlowNoRedirect
+    codigo = " ".join(context.args).strip()
+    if not codigo:
+        return await update.message.reply_text("Use: /ativar <codigo>")
+
+    auth_flow = context.user_data.get("auth_flow")
+    if not auth_flow:
+        auth_flow = DropboxOAuth2FlowNoRedirect(
+            DROPBOX_APP_KEY,
+            DROPBOX_APP_SECRET,
+            token_access_type='offline'
+        )
+
+    try:
+        result = auth_flow.finish(codigo)
+        refresh_token = result.refresh_token
+        await update.message.reply_text(
+            f"✅ Dropbox autorizado!\n\n"
+            f"Agora adicione esta variável no Railway:\n\n"
+            f"`DROPBOX_REFRESH_TOKEN`\n`{refresh_token}`\n\n"
+            f"Depois faça um redeploy e o Dropbox funcionará permanentemente! 🎉",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erro ao ativar: {e}")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -357,6 +410,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("limpar", limpar))
+    app.add_handler(CommandHandler("autorizar", cmd_autorizar))
+    app.add_handler(CommandHandler("ativar", cmd_ativar))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
