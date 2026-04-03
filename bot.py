@@ -1,6 +1,7 @@
 import os
 import logging
 import io
+import json
 import dropbox
 from dropbox.exceptions import ApiError
 from telegram import Update
@@ -25,43 +26,206 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 DROPBOX_ACCESS_TOKEN = os.environ.get("DROPBOX_ACCESS_TOKEN", "")
 
-# Memória de conversa por usuário
 conversation_history: dict[int, list] = {}
-
-# Pasta atual do Dropbox por usuário
 dropbox_dir: dict[int, str] = {}
 
-SYSTEM_PROMPT = """Você é um assistente pessoal inteligente no Telegram.
-Seu objetivo é ajudar o usuário com:
-- Responder perguntas gerais de forma clara e objetiva
-- Ajudar com tarefas do dia a dia
-- Fazer resumos de textos que o usuário enviar
-- Criar lembretes e listas de tarefas
-- Dar dicas e sugestões úteis
-
+SYSTEM_PROMPT = """Você é o CBCAP, assistente pessoal inteligente no Telegram.
 Responda sempre em português brasileiro, de forma amigável e direta.
 Seja conciso — evite respostas longas demais no Telegram.
-Use emojis com moderação para deixar as respostas mais agradáveis.
+
+Você tem acesso ao Dropbox do usuário através de ferramentas. Quando o usuário pedir para ver arquivos, abrir pastas, ler documentos, baixar ou enviar arquivos, use as ferramentas disponíveis automaticamente — sem pedir para o usuário digitar comandos.
 
 Data e hora atual: {datetime}
 """
 
-# ─── Helpers Dropbox ─────────────────────────────────────────────
+# ─── Dropbox Tools ───────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "name": "listar_arquivos",
+        "description": "Lista arquivos e pastas no Dropbox. Use quando o usuário quiser ver seus arquivos, abrir o Dropbox, ver o que tem em uma pasta, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho da pasta no Dropbox. Use string vazia '' para a raiz. Exemplo: '/Documentos' ou ''"
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "ler_arquivo",
+        "description": "Lê o conteúdo de um arquivo de texto no Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho completo do arquivo no Dropbox. Exemplo: '/Documentos/notas.txt'"
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "baixar_arquivo",
+        "description": "Baixa um arquivo do Dropbox e envia para o usuário no Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho completo do arquivo no Dropbox."
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "criar_pasta",
+        "description": "Cria uma nova pasta no Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho completo da nova pasta. Exemplo: '/Projetos/Novo'"
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "deletar_item",
+        "description": "Deleta um arquivo ou pasta do Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho completo do arquivo ou pasta a deletar."
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "mover_item",
+        "description": "Move ou renomeia um arquivo ou pasta no Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "origem": {
+                    "type": "string",
+                    "description": "Caminho de origem."
+                },
+                "destino": {
+                    "type": "string",
+                    "description": "Caminho de destino."
+                }
+            },
+            "required": ["origem", "destino"]
+        }
+    },
+    {
+        "name": "gerar_link",
+        "description": "Gera um link de compartilhamento para um arquivo no Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "caminho": {
+                    "type": "string",
+                    "description": "Caminho completo do arquivo."
+                }
+            },
+            "required": ["caminho"]
+        }
+    },
+    {
+        "name": "buscar_arquivos",
+        "description": "Busca arquivos ou pastas no Dropbox pelo nome.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "termo": {
+                    "type": "string",
+                    "description": "Termo de busca."
+                }
+            },
+            "required": ["termo"]
+        }
+    }
+]
+
+# ─── Execução das Tools ──────────────────────────────────────────
 
 def get_dbx():
     return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-def get_db_dir(user_id: int) -> str:
-    return dropbox_dir.get(user_id, "")
+def execute_tool(tool_name: str, tool_input: dict) -> str:
+    try:
+        dbx = get_dbx()
 
-def db_full_path(user_id: int, name: str) -> str:
-    d = get_db_dir(user_id)
-    return f"/{name}" if d == "" else f"{d}/{name}"
+        if tool_name == "listar_arquivos":
+            caminho = tool_input.get("caminho", "")
+            res = dbx.files_list_folder(caminho)
+            pastas = [f"📁 {e.name}" for e in res.entries if isinstance(e, dropbox.files.FolderMetadata)]
+            arquivos = [f"📄 {e.name}" for e in res.entries if isinstance(e, dropbox.files.FileMetadata)]
+            label = caminho or "/"
+            conteudo = "\n".join(pastas + arquivos) or "(vazio)"
+            return f"Pasta: {label}\n\n{conteudo}"
 
-def format_entries(entries) -> str:
-    pastas = [f"📁 {e.name}" for e in entries if isinstance(e, dropbox.files.FolderMetadata)]
-    arquivos = [f"📄 {e.name}" for e in entries if isinstance(e, dropbox.files.FileMetadata)]
-    return "\n".join(pastas + arquivos) or "(vazio)"
+        elif tool_name == "ler_arquivo":
+            caminho = tool_input["caminho"]
+            _, res = dbx.files_download(caminho)
+            text = res.content.decode("utf-8", errors="replace")
+            return text[:3000] + ("...(cortado)" if len(text) > 3000 else "")
+
+        elif tool_name == "criar_pasta":
+            caminho = tool_input["caminho"]
+            dbx.files_create_folder_v2(caminho)
+            return f"Pasta criada: {caminho}"
+
+        elif tool_name == "deletar_item":
+            caminho = tool_input["caminho"]
+            dbx.files_delete_v2(caminho)
+            return f"Deletado: {caminho}"
+
+        elif tool_name == "mover_item":
+            dbx.files_move_v2(tool_input["origem"], tool_input["destino"])
+            return f"Movido: {tool_input['origem']} → {tool_input['destino']}"
+
+        elif tool_name == "gerar_link":
+            caminho = tool_input["caminho"]
+            try:
+                res = dbx.sharing_create_shared_link_with_settings(caminho)
+                return f"Link: {res.url}"
+            except ApiError:
+                res = dbx.sharing_list_shared_links(path=caminho, direct_only=True)
+                if res.links:
+                    return f"Link: {res.links[0].url}"
+                return "Não foi possível gerar o link."
+
+        elif tool_name == "buscar_arquivos":
+            termo = tool_input["termo"]
+            res = dbx.files_search_v2(termo)
+            if not res.matches:
+                return f"Nada encontrado para '{termo}'."
+            lista = []
+            for m in res.matches[:20]:
+                meta = m.metadata.get_metadata()
+                icon = "📁" if isinstance(meta, dropbox.files.FolderMetadata) else "📄"
+                lista.append(f"{icon} {meta.path_display}")
+            return "\n".join(lista)
+
+        return "Ferramenta não reconhecida."
+
+    except ApiError as e:
+        return f"Erro no Dropbox: {e}"
+    except Exception as e:
+        return f"Erro: {e}"
 
 # ─── Handlers ────────────────────────────────────────────────────
 
@@ -70,47 +234,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation_history[user.id] = []
     await update.message.reply_text(
         f"Olá, {user.first_name}! 👋\n\n"
-        "Sou seu assistente pessoal com IA.\n\n"
-        "— GERAL —\n"
-        "/ajuda — ver todos os comandos\n"
-        "/limpar — limpar histórico\n\n"
-        "— DROPBOX ☁️ —\n"
-        "/dropbox — acessar raiz\n"
-        "/dls — listar pasta atual\n"
-        "/dcd <pasta> — navegar\n"
-        "/dpwd — ver pasta atual\n"
-        "/dread <arquivo> — ler arquivo\n"
-        "/dget <arquivo> — baixar arquivo\n"
-        "/dmkdir <nome> — criar pasta\n"
-        "/drm <nome> — deletar\n"
-        "/dmv <origem> > <destino> — mover/renomear\n"
-        "/dlink <arquivo> — link de compartilhamento\n"
-        "/dfind <nome> — buscar\n"
-        "📎 Envie um arquivo → salva na pasta atual"
-    )
-
-
-async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Comandos disponíveis:*\n\n"
-        "*Geral:*\n"
-        "/start — Reiniciar o bot\n"
-        "/limpar — Limpar histórico\n"
-        "/ajuda — Esta mensagem\n\n"
-        "*Dropbox ☁️:*\n"
-        "/dropbox — Raiz do Dropbox\n"
-        "/dls — Listar pasta atual\n"
-        "/dcd <pasta> — Navegar\n"
-        "/dpwd — Pasta atual\n"
-        "/dread <arquivo> — Ler arquivo\n"
-        "/dget <arquivo> — Baixar arquivo\n"
-        "/dmkdir <nome> — Criar pasta\n"
-        "/drm <nome> — Deletar\n"
-        "/dmv <origem> > <destino> — Mover/renomear\n"
-        "/dlink <arquivo> — Link de compartilhamento\n"
-        "/dfind <nome> — Buscar\n"
-        "📎 Envie um arquivo → upload para pasta atual",
-        parse_mode="Markdown",
+        "Sou o CBCAP, seu assistente pessoal com acesso ao Dropbox.\n\n"
+        "Pode falar naturalmente:\n"
+        "• \"Mostra meus arquivos do Dropbox\"\n"
+        "• \"Abre a pasta Documentos\"\n"
+        "• \"Lê o arquivo notas.txt\"\n"
+        "• \"Busca por contratos\"\n"
+        "• \"Gera um link para o relatório.pdf\"\n\n"
+        "Ou envie um arquivo aqui para salvar no Dropbox! 📎"
     )
 
 
@@ -120,206 +251,17 @@ async def limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧹 Histórico apagado!")
 
 
-# ─── Dropbox Commands ─────────────────────────────────────────────
-
-async def cmd_dropbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    dropbox_dir[user_id] = ""
-    try:
-        dbx = get_dbx()
-        res = dbx.files_list_folder("")
-        texto = f"☁️ Dropbox — Raiz\n\n{format_entries(res.entries)}"
-        await update.message.reply_text(texto[:4000])
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dls(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    d = get_db_dir(user_id)
-    try:
-        dbx = get_dbx()
-        res = dbx.files_list_folder(d)
-        label = "/" if d == "" else d
-        texto = f"☁️ {label}\n\n{format_entries(res.entries)}"
-        await update.message.reply_text(texto[:4000])
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dpwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    d = get_db_dir(user_id)
-    await update.message.reply_text(f"☁️ {d or '/ (raiz)'}")
-
-
-async def cmd_dcd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dcd <nome da pasta>")
-
-    d = get_db_dir(user_id)
-    if args == "..":
-        new_dir = "" if "/" not in d.lstrip("/") else d.rsplit("/", 1)[0]
-    elif args == "/":
-        new_dir = ""
-    else:
-        new_dir = f"/{args}" if d == "" else f"{d}/{args}"
-
-    try:
-        dbx = get_dbx()
-        dbx.files_get_metadata(new_dir)
-        dropbox_dir[user_id] = new_dir
-        res = dbx.files_list_folder(new_dir)
-        label = new_dir or "/"
-        texto = f"☁️ {label}\n\n{format_entries(res.entries)}"
-        await update.message.reply_text(texto[:4000])
-    except ApiError:
-        await update.message.reply_text(f"❌ Pasta não encontrada: {args}")
-
-
-async def cmd_dread(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dread <nome do arquivo>")
-
-    file_path = db_full_path(user_id, args)
-    try:
-        dbx = get_dbx()
-        _, res = dbx.files_download(file_path)
-        text = res.content.decode("utf-8", errors="replace")
-        preview = text[:3800]
-        await update.message.reply_text(f"📄 {args}:\n\n{preview}{'...(cortado)' if len(text) > 3800 else ''}")
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dget(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dget <nome do arquivo>")
-
-    file_path = db_full_path(user_id, args)
-    await update.message.reply_text(f"⬇️ Baixando \"{args}\"...")
-    try:
-        dbx = get_dbx()
-        _, res = dbx.files_download(file_path)
-        await update.message.reply_document(
-            document=io.BytesIO(res.content),
-            filename=args
-        )
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dmkdir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dmkdir <nome da pasta>")
-
-    folder_path = db_full_path(user_id, args)
-    try:
-        dbx = get_dbx()
-        dbx.files_create_folder_v2(folder_path)
-        await update.message.reply_text(f"✅ Pasta criada: {folder_path}")
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_drm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /drm <nome>")
-
-    target = db_full_path(user_id, args)
-    try:
-        dbx = get_dbx()
-        dbx.files_delete_v2(target)
-        await update.message.reply_text(f"🗑️ Deletado: {target}")
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dmv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.split(" ", 1)[1] if len(update.message.text.split(" ", 1)) > 1 else ""
-    parts = text.split(">")
-    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
-        return await update.message.reply_text("Use: /dmv <origem> > <destino>")
-
-    from_path = db_full_path(user_id, parts[0].strip())
-    to_path = db_full_path(user_id, parts[1].strip())
-    try:
-        dbx = get_dbx()
-        dbx.files_move_v2(from_path, to_path)
-        await update.message.reply_text(f"✅ Movido: {parts[0].strip()} → {parts[1].strip()}")
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dlink <nome do arquivo>")
-
-    file_path = db_full_path(user_id, args)
-    try:
-        dbx = get_dbx()
-        try:
-            res = dbx.sharing_create_shared_link_with_settings(file_path)
-            await update.message.reply_text(f"🔗 Link: {res.url}")
-        except ApiError:
-            res = dbx.sharing_list_shared_links(path=file_path, direct_only=True)
-            if res.links:
-                await update.message.reply_text(f"🔗 Link: {res.links[0].url}")
-            else:
-                await update.message.reply_text("❌ Não foi possível gerar o link.")
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
-async def cmd_dfind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = " ".join(context.args).strip()
-    if not args:
-        return await update.message.reply_text("Use: /dfind <nome>")
-
-    await update.message.reply_text(f"🔍 Buscando \"{args}\" no Dropbox...")
-    try:
-        dbx = get_dbx()
-        res = dbx.files_search_v2(args)
-        matches = res.matches
-        if not matches:
-            return await update.message.reply_text(f"❌ Nada encontrado para \"{args}\".")
-        lista = []
-        for m in matches[:30]:
-            meta = m.metadata.get_metadata()
-            icon = "📁" if isinstance(meta, dropbox.files.FolderMetadata) else "📄"
-            lista.append(f"{icon} {meta.path_display}")
-        await update.message.reply_text(f"🔍 Resultados:\n\n" + "\n".join(lista))
-    except ApiError as e:
-        await update.message.reply_text(f"❌ Erro: {e}")
-
-
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     doc = update.message.document
-    d = get_db_dir(user_id)
-    dest = f"/{doc.file_name}" if d == "" else f"{d}/{doc.file_name}"
-
     await update.message.reply_text(f"⬆️ Enviando \"{doc.file_name}\" para o Dropbox...")
     try:
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
         dbx = get_dbx()
+        dest = f"/{doc.file_name}"
         dbx.files_upload(bytes(content), dest, mode=dropbox.files.WriteMode.overwrite)
         await update.message.reply_text(f"✅ Salvo em: {dest}")
-    except ApiError as e:
+    except Exception as e:
         await update.message.reply_text(f"❌ Erro no upload: {e}")
 
 
@@ -339,31 +281,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        system = SYSTEM_PROMPT.format(datetime=datetime.now().strftime("%d/%m/%Y %H:%M"))
+        messages = list(conversation_history[user_id])
 
-        system = SYSTEM_PROMPT.format(
-            datetime=datetime.now().strftime("%d/%m/%Y %H:%M")
-        )
+        # Loop de tool use
+        while True:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2048,
+                system=system,
+                tools=TOOLS,
+                messages=messages,
+            )
 
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=system,
-            messages=conversation_history[user_id],
-        )
+            # Se parou por tool_use, executa as ferramentas
+            if response.stop_reason == "tool_use":
+                # Adiciona resposta do assistente ao histórico
+                messages.append({"role": "assistant", "content": response.content})
 
-        assistant_reply = response.content[0].text
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        await context.bot.send_chat_action(
+                            chat_id=update.effective_chat.id, action="typing"
+                        )
+                        result = execute_tool(block.name, block.input)
 
-        conversation_history[user_id].append(
-            {"role": "assistant", "content": assistant_reply}
-        )
+                        # Se for download, envia o arquivo separadamente
+                        if block.name == "baixar_arquivo":
+                            try:
+                                dbx = get_dbx()
+                                caminho = block.input["caminho"]
+                                _, res = dbx.files_download(caminho)
+                                nome = caminho.split("/")[-1]
+                                await update.message.reply_document(
+                                    document=io.BytesIO(res.content),
+                                    filename=nome
+                                )
+                                result = f"Arquivo '{nome}' enviado com sucesso."
+                            except Exception as e:
+                                result = f"Erro ao baixar: {e}"
 
-        await update.message.reply_text(assistant_reply)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
+
+                messages.append({"role": "user", "content": tool_results})
+
+            else:
+                # Resposta final em texto
+                final_reply = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        final_reply += block.text
+
+                if final_reply:
+                    # Salva no histórico apenas a resposta de texto
+                    conversation_history[user_id].append(
+                        {"role": "assistant", "content": final_reply}
+                    )
+                    await update.message.reply_text(final_reply)
+                break
 
     except Exception as e:
-        logger.error(f"Erro ao chamar a API: {e}")
-        await update.message.reply_text(
-            "⚠️ Ops, tive um problema ao processar sua mensagem. Tente novamente."
-        )
+        logger.error(f"Erro: {e}")
+        await update.message.reply_text("⚠️ Ops, tive um problema. Tente novamente.")
 
 
 # ─── Main ────────────────────────────────────────────────────────
@@ -372,23 +356,8 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ajuda", ajuda))
     app.add_handler(CommandHandler("limpar", limpar))
-
-    # Dropbox
-    app.add_handler(CommandHandler("dropbox", cmd_dropbox))
-    app.add_handler(CommandHandler("dls", cmd_dls))
-    app.add_handler(CommandHandler("dpwd", cmd_dpwd))
-    app.add_handler(CommandHandler("dcd", cmd_dcd))
-    app.add_handler(CommandHandler("dread", cmd_dread))
-    app.add_handler(CommandHandler("dget", cmd_dget))
-    app.add_handler(CommandHandler("dmkdir", cmd_dmkdir))
-    app.add_handler(CommandHandler("drm", cmd_drm))
-    app.add_handler(CommandHandler("dmv", cmd_dmv))
-    app.add_handler(CommandHandler("dlink", cmd_dlink))
-    app.add_handler(CommandHandler("dfind", cmd_dfind))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot iniciado! Aguardando mensagens...")
